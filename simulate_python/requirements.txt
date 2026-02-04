@@ -1,0 +1,7 @@
+# Unitree LCM bridge and MuJoCo sim
+# For environments where unitree_sdk2py is not available (e.g. Apple Silicon)
+lcm>=1.5.0
+# Additional deps for unitree_mujoco.py:
+# mujoco
+# pygame
+# numpy
