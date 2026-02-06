@@ -25,6 +25,12 @@ if sys.platform == "darwin" and os.environ.get("MUJOCO_MJPYTHON_REELEXEC") != "1
     )
     sys.exit(1)
 
+# So play.py and sim use the same LCM URL when sim is started by play.
+for i, a in enumerate(sys.argv):
+    if a == "--lcm-url" and i + 1 < len(sys.argv):
+        os.environ["LCM_DEFAULT_URL"] = sys.argv[i + 1]
+        break
+
 import mujoco
 import mujoco.viewer
 
@@ -32,14 +38,11 @@ from unitree_lcm_bridge import ChannelFactoryInitialize, UnitreeSdk2Bridge, Elas
 
 import config
 
-# On macOS, mjpython runs the script on a non–Cocoa-main thread, so any pygame/SDL event
-# call (init, pump, get) triggers "nextEventMatchingMask should only be called from the
-# Main Thread!" and crashes. Disable joystick on macOS so the sim runs without it.
-USE_JOYSTICK = config.USE_JOYSTICK and sys.platform != "darwin"
-if config.USE_JOYSTICK and not USE_JOYSTICK:
-    print("Joystick disabled on macOS (pygame/SDL requires Cocoa main thread).", file=sys.stderr)
-
-if USE_JOYSTICK:
+# On macOS, pygame must run on the main thread. The sim thread does not call pygame;
+# main_loop() (main thread) reads the joystick and sets external state on the bridge.
+USE_JOYSTICK = config.USE_JOYSTICK
+JOYSTICK_ON_MAIN_THREAD = USE_JOYSTICK and sys.platform == "darwin"
+if USE_JOYSTICK and not JOYSTICK_ON_MAIN_THREAD:
     import warnings
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
@@ -47,6 +50,8 @@ if USE_JOYSTICK:
         pygame.init()
         pygame.joystick.init()
 
+# Bridge reference so main_loop (main thread) can set external joystick state on macOS.
+bridge_ref = [None]
 locker = threading.Lock()
 
 mj_model = mujoco.MjModel.from_xml_path(config.ROBOT_SCENE)
@@ -76,10 +81,14 @@ def SimulationThread():
     global mj_data, mj_model
 
     ChannelFactoryInitialize(config.DOMAIN_ID, config.INTERFACE)
-    unitree = UnitreeSdk2Bridge(mj_model, mj_data)
+    unitree = UnitreeSdk2Bridge(mj_model, mj_data, data_lock=locker)
+    bridge_ref[0] = unitree
 
     if USE_JOYSTICK:
-        unitree.SetupJoystick(device_id=0, js_type=config.JOYSTICK_TYPE)
+        if JOYSTICK_ON_MAIN_THREAD:
+            unitree.SetJoystickMapping(config.JOYSTICK_TYPE)
+        else:
+            unitree.SetupJoystick(device_id=0, js_type=config.JOYSTICK_TYPE)
     if config.PRINT_SCENE_INFORMATION:
         unitree.PrintSceneInformation()
 
@@ -113,15 +122,21 @@ def PhysicsViewerThread():
 
 
 def main_loop():
-    """Main thread: pump pygame events when using joystick (non-macOS), wait for viewer/sim threads."""
     viewer_thread = Thread(target=PhysicsViewerThread)
     sim_thread = Thread(target=SimulationThread)
     viewer_thread.start()
     sim_thread.start()
+
     while True:
         if USE_JOYSTICK:
-            import pygame
-            pygame.event.pump()
+            if JOYSTICK_ON_MAIN_THREAD and bridge_ref[0] is not None:
+                from unitree_lcm_bridge import WirelessController_
+                w = WirelessController_()
+                bridge_ref[0].set_external_wireless_controller(w)
+            else:
+                if not JOYSTICK_ON_MAIN_THREAD:
+                    import pygame
+                    pygame.event.pump()
         viewer_thread.join(timeout=0.02)
         sim_thread.join(timeout=0.02)
         if not viewer_thread.is_alive() and not sim_thread.is_alive():
@@ -129,4 +144,10 @@ def main_loop():
 
 
 if __name__ == "__main__":
-    main_loop()
+    try:
+        main_loop()
+    except Exception as e:
+        import traceback
+        print("Simulator exited with error:", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
